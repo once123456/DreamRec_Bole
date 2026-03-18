@@ -1,0 +1,84 @@
+# ── 核心运行配置 ────────────────────────────────────
+gpu_id: '0'
+device: cuda  # 补充：指定设备（兼容CPU/GPU）
+log_wandb: False
+seed: 2024
+reproducibility: True  # 补充：保证实验可复现
+show_progress: True    # 补充：显示训练进度条
+save_result: True      # 补充：保存测试结果
+save_model: True       # 补充：保存最优模型
+
+# ── 数据集设置（完全保留你的配置，仅补充必要项）────
+# ml-1m setting:
+dataset: ml-1m
+MAX_ITEM_LIST_LENGTH: 200
+
+# # amazon-beauty setting:
+# dataset: amazon-beauty
+# MAX_ITEM_LIST_LENGTH: 50
+
+# # amazon-video-games setting:
+# dataset: amazon-video-games
+# MAX_ITEM_LIST_LENGTH: 50
+
+# # kuairand setting:
+# dataset: kuairand
+# MAX_ITEM_LIST_LENGTH: 50
+
+# ── 字段映射（完全保留）────────────────────────────
+USER_ID_FIELD: user_id
+ITEM_ID_FIELD: item_id
+TIME_FIELD: timestamp  # 补充：序列推荐必需时间字段
+load_col:
+    inter: [user_id, item_id, timestamp]
+
+user_inter_num_interval: "[5,inf)"
+item_inter_num_interval: "[5,inf)"
+
+# ── DreamRec 模型超参（完全保留，仅注释冗余项）─────
+# encoder 部分
+hidden_size: 64          
+n_heads: 1               
+n_layers: 1              
+attn_dropout_prob: 0.1   
+
+# 前馈层配置
+inner_size: 256          
+hidden_dropout_prob: 0.1 
+hidden_act: 'relu'       
+
+# 归一化配置
+layer_norm_eps: 1e-12    
+initializer_range: 1.0   
+
+loss_type: 'CE'          
+# DreamRec 专属配置
+p: 0.1                   
+timesteps: 200           
+beta_start: 0.0001       
+beta_end: 0.02           
+beta_sche: 'exp'         
+w: 2.0                   
+diffuser_type: 'mlp1'    
+
+# ── 训练配置（修正 RecBole 原生参数）───────────────
+epochs: 1               # 快速验证用，后续改300
+train_batch_size: 1024
+learner: adam
+learning_rate: 0.001
+eval_step: 1            # 每1个epoch评估一次
+stop_steps: 10          # 修正：早停步数（替代stopping_step）
+weight_decay: 0.0
+train_neg_sample_args: ~
+
+# ── 评估配置（修正 RecBole 原生参数）───────────────
+metrics: ['NDCG', 'MRR', 'Hit']
+valid_metric: NDCG@10   # 早停监控指标
+eval_batch_size: 2048
+topk: [10, 20]
+# 补充：评估模式配置（原生RecBole必需）
+eval_args:
+    split: {'LS': 'valid_and_test'}
+    order: 'TO'
+    group_by: 'user'
+    mode: {'valid': 'full', 'test': 'full'}
