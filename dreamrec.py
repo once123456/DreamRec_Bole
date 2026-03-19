@@ -5,50 +5,7 @@ from recbole.model.layers import TransformerEncoder
 #from recbole.model.sequential_recommender import get_attention_mask  # 补充：RecBole 掩码工具（因果掩码核心）
 import numpy as np
 import math
-
-class Diffusion(nn.Module):
-    def __init__(self, config, device):
-        super().__init__()
-        self.timesteps = config['timesteps']
-        self.beta_start = config['beta_start']
-        self.beta_end = config['beta_end']
-        self.beta_sche = config['beta_sche']
-        self.w = config['w']
-        self.diffuser_type = config['diffuser_type']
-        
-        # 预计算 beta 和相关系数
-        self.register_buffer('betas', self.get_beta_schedule())
-        alphas = 1.0 - self.betas
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
-        self.register_buffer('alphas_cumprod', alphas_cumprod)
-        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
-        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1 - alphas_cumprod))
-        
-        # 定义简单的 MLP 作为 Diffuser
-        if self.diffuser_type == 'mlp1':
-            self.diffuser = nn.Sequential(
-                nn.Linear(config['hidden_size']*3, config['hidden_size']*2),
-                nn.GELU(),
-                nn.Linear(config['hidden_size']*2, config['hidden_size'])
-            )
-        elif self.diffuser_type == 'mlp2':
-            self.diffuser = nn.Sequential(
-                nn.Linear(config['hidden_size']*3, config['hidden_size']*4),
-                nn.GELU(),
-                nn.Linear(config['hidden_size']*4, config['hidden_size'])
-            )
-    
-    def get_beta_schedule(self):
-        if self.beta_sche == 'linear':
-            return torch.linspace(self.beta_start, self.beta_end, steps=self.timesteps)
-        elif self.beta_sche == 'cosine':
-            steps = torch.arange(self.timesteps + 1)
-            alphas_cumprod = torch.cos((steps / (self.timesteps + 1)) * math.pi / 2) ** 2
-            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-            return betas.clamp(0, 0.999)
-
-
+from diffusion import Diffusion, extract  # 补充：引入 Diffusion 模块和 extract 工具函数
 
 class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim):
@@ -70,9 +27,12 @@ class DreamRec(SequentialRecommender):
     DreamRec: Guided Diffusion for Sequential Recommendation
     优化：区分训练/推理阶段，仅训练时启用随机mask
     """
+    input_type = 'sequential'  # 明确输入类型，便于RecBole适配
+    
     def __init__(self, config, dataset):
         super().__init__(config, dataset)
 
+        self.device = config['device']
         # ── 基础参数 ─────────────────────────────────────
         self.hidden_size = config['hidden_size']
         self.n_layers = config['n_layers']
@@ -211,36 +171,34 @@ class DreamRec(SequentialRecommender):
     
     def forward(self, x,h,step):
         t = self.step_mlp(step)  # 时间编码
-        if self.diffuser_type == 'mlp1':
-            res = self.diffuser(torch.cat((x, h, t), dim=1))
-        elif self.diffuser_type == 'mlp2':
-            res = self.diffuser(torch.cat((x, h, t), dim=1))
+        res = self.diffusion.diffuser(torch.cat((x, h, t), dim=1))
         return res
     
-    def forward_unconditional(self, x, step):
+    def forward_uncond(self, x, step):
         #不是很确定这里，到时候在看着改改
         h = self.none_embedding(torch.tensor([0], device=x.device))  # 无条件向量
         h = torch.cat([h] * x.size(0), dim=0)  # 扩展到批次大小
         
         t = self.step_mlp(step)  # 时间编码
-        if self.diffuser_type == 'mlp1':
-            res = self.diffuser(torch.cat((x, self.none_embedding.weight[0:1].expand(x.size(0), -1), t), dim=1))
-        elif self.diffuser_type == 'mlp2':
-            res = self.diffuser(torch.cat((x, self.none_embedding.weight[0:1].expand(x.size(0), -1), t), dim=1))
+        res = self.diffusion.diffuser(torch.cat((x, self.none_embedding.weight[0:1].expand(x.size(0), -1), t), dim=1))
         return res
     
     def calculate_loss(self, interaction):
-        """训练阶段：自动启用drop"""
+        # 1. 提取 RecBole 数据
         item_seq = interaction[self.ITEM_SEQ]
         item_seq_len = interaction[self.ITEM_SEQ_LEN]
         pos_items = interaction[self.POS_ITEM_ID]
+        # 2. 编码用户兴趣 h
+        h = self.cacu_h(item_seq, item_seq_len)
+        # 3. 目标物品嵌入 x_start
+        x_start = self.cacu_x(pos_items)
+        # 4. 随机采样扩散步数
+        B = item_seq.size(0)
+        t = torch.randint(0, self.diffusion.timesteps, (B,), device=self.device).long()
+        # 5. 计算扩散损失（不再传loss_type，从配置读取）
+        loss, _ = self.diffusion.p_losses(self.forward, x_start, h, t)
 
-        # 训练阶段：enable_drop=True（或不传，依赖self.training）
-        seq_output = self.forward(item_seq, item_seq_len)  # [B, H]，带drop的h
-        logits = self.proj(seq_output)
-        loss = self.loss_fct(logits, pos_items)
         return loss
-
     def full_sort_predict(self, interaction):
         """推理阶段：强制关闭drop"""
         item_seq = interaction[self.ITEM_SEQ]

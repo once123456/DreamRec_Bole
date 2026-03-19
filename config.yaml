@@ -1,14 +1,14 @@
 # ── 核心运行配置 ────────────────────────────────────
 gpu_id: '0'
-device: cuda  # 补充：指定设备（兼容CPU/GPU）
+device: cuda  # 指定设备（兼容CPU/GPU）
 log_wandb: False
 seed: 2024
-reproducibility: True  # 补充：保证实验可复现
-show_progress: True    # 补充：显示训练进度条
-save_result: True      # 补充：保存测试结果
-save_model: True       # 补充：保存最优模型
+reproducibility: True  # 保证实验可复现
+show_progress: True    # 显示训练进度条
+save_result: True      # 保存测试结果
+save_model: True       # 保存最优模型
 
-# ── 数据集设置（完全保留你的配置，仅补充必要项）────
+# ── 数据集设置 ─────────────────────────────────────
 # ml-1m setting:
 dataset: ml-1m
 MAX_ITEM_LIST_LENGTH: 200
@@ -25,60 +25,65 @@ MAX_ITEM_LIST_LENGTH: 200
 # dataset: kuairand
 # MAX_ITEM_LIST_LENGTH: 50
 
-# ── 字段映射（完全保留）────────────────────────────
+# ── 字段映射（序列推荐必需）────────────────────────
 USER_ID_FIELD: user_id
 ITEM_ID_FIELD: item_id
-TIME_FIELD: timestamp  # 补充：序列推荐必需时间字段
+TIME_FIELD: timestamp  # 序列推荐必需时间字段
 load_col:
     inter: [user_id, item_id, timestamp]
 
+# 数据过滤（保留交互数≥5的用户/物品，避免冷启动）
 user_inter_num_interval: "[5,inf)"
 item_inter_num_interval: "[5,inf)"
 
-# ── DreamRec 模型超参（完全保留，仅注释冗余项）─────
-# encoder 部分
-hidden_size: 64          
-n_heads: 1               
-n_layers: 1              
-attn_dropout_prob: 0.1   
+# ── DreamRec 模型超参（对齐原版）───────────────────
+# Transformer 编码器配置
+hidden_size: 64          # 原版 hidden_factor
+n_heads: 1               # 原版默认1头注意力
+n_layers: 1              # 原版默认1层Transformer
+attn_dropout_prob: 0.1   # 注意力层dropout
 
-# 前馈层配置
-inner_size: 256          
-hidden_dropout_prob: 0.1 
-hidden_act: 'relu'       
+# 前馈层配置（对齐原版）
+inner_size: 64           # 修正：与hidden_size一致（原版无256）
+hidden_dropout_prob: 0.1 # 前馈层dropout
+hidden_act: 'gelu'       # 修正：原版用gelu，不是relu
 
 # 归一化配置
-layer_norm_eps: 1e-12    
-initializer_range: 1.0   
+layer_norm_eps: 1e-12    # 原版默认
+initializer_range: 1.0   # 原版初始化标准差
 
-loss_type: 'CE'          
-# DreamRec 专属配置
-p: 0.1                   
-timesteps: 200           
-beta_start: 0.0001       
-beta_end: 0.02           
-beta_sche: 'exp'         
-w: 2.0                   
-diffuser_type: 'mlp1'    
+# DreamRec 专属扩散配置
+p: 0.1                    # classifier-free drop概率
+timesteps: 200            # 扩散总步数
+beta_start: 0.0001       # 初始加噪强度
+beta_end: 0.02           # 最终加噪强度
+beta_sche: 'exp'         # beta调度策略（原版默认exp）
+w: 2.0                   # classifier-free引导权重
+diffuser_type: 'mlp1'     # 去噪网络类型（原版默认mlp1）
+
+# 扩散损失配置（新增：适配配置化损失函数）
+#diffusion:
+loss_type: 'l2'        # 原版默认L2（MSE），可选l1/huber
+loss_weight: 1.0       # 损失权重（多任务时可调）
 
 # ── 训练配置（修正 RecBole 原生参数）───────────────
-epochs: 1               # 快速验证用，后续改300
-train_batch_size: 1024
-learner: adam
-learning_rate: 0.001
-eval_step: 1            # 每1个epoch评估一次
-stop_steps: 10          # 修正：早停步数（替代stopping_step）
-weight_decay: 0.0
-train_neg_sample_args: ~
+epochs: 1                # 【测试用】快速验证，正式训练改300
+train_batch_size: 1024   # 可根据GPU显存调整（原版256）
+learner: adam            # 原版优化器
+learning_rate: 0.005     # 修正：原版0.005，不是0.001
+eval_step: 1             # 每1个epoch评估一次
+stopping_step: 10        # 修正：早停步数（RecBole原生参数）
+weight_decay: 0.0        # 原版无权重衰减
+train_neg_sample_args: ~ # DreamRec 无需负采样（扩散损失不需要）
 
 # ── 评估配置（修正 RecBole 原生参数）───────────────
-metrics: ['NDCG', 'MRR', 'Hit']
-valid_metric: NDCG@10   # 早停监控指标
-eval_batch_size: 2048
-topk: [10, 20]
-# 补充：评估模式配置（原生RecBole必需）
+metrics: ['NDCG', 'MRR', 'Hit']  # 原版评估指标
+valid_metric: NDCG@10            # 早停监控指标
+eval_batch_size: 2048            # 可根据GPU显存调整
+topk: [10, 20]                   # 原版评估Top10/20
+# 评估模式配置（修正：RecBole原生格式）
 eval_args:
-    split: {'LS': 'valid_and_test'}
-    order: 'TO'
-    group_by: 'user'
-    mode: {'valid': 'full', 'test': 'full'}
+    split: {'LS': 'valid_and_test'}  # 按用户历史拆分验证/测试集
+    order: 'TO'                      # 时间序拆分（序列推荐必需）
+    group_by: 'user'                 # 按用户分组
+    mode: 'full'                     # 修正：字符串格式，不是字典
