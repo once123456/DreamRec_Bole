@@ -6,13 +6,70 @@ from recbole.model.layers import TransformerEncoder
 import numpy as np
 import math
 
+class Diffusion(nn.Module):
+    def __init__(self, config, device):
+        super().__init__()
+        self.timesteps = config['timesteps']
+        self.beta_start = config['beta_start']
+        self.beta_end = config['beta_end']
+        self.beta_sche = config['beta_sche']
+        self.w = config['w']
+        self.diffuser_type = config['diffuser_type']
+        
+        # 预计算 beta 和相关系数
+        self.register_buffer('betas', self.get_beta_schedule())
+        alphas = 1.0 - self.betas
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.register_buffer('alphas_cumprod', alphas_cumprod)
+        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
+        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1 - alphas_cumprod))
+        
+        # 定义简单的 MLP 作为 Diffuser
+        if self.diffuser_type == 'mlp1':
+            self.diffuser = nn.Sequential(
+                nn.Linear(config['hidden_size']*3, config['hidden_size']*2),
+                nn.GELU(),
+                nn.Linear(config['hidden_size']*2, config['hidden_size'])
+            )
+        elif self.diffuser_type == 'mlp2':
+            self.diffuser = nn.Sequential(
+                nn.Linear(config['hidden_size']*3, config['hidden_size']*4),
+                nn.GELU(),
+                nn.Linear(config['hidden_size']*4, config['hidden_size'])
+            )
+    
+    def get_beta_schedule(self):
+        if self.beta_sche == 'linear':
+            return torch.linspace(self.beta_start, self.beta_end, steps=self.timesteps)
+        elif self.beta_sche == 'cosine':
+            steps = torch.arange(self.timesteps + 1)
+            alphas_cumprod = torch.cos((steps / (self.timesteps + 1)) * math.pi / 2) ** 2
+            alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
+            betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
+            return betas.clamp(0, 0.999)
 
+
+
+class SinusoidalPositionEmbeddings(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, time):
+        device = time.device
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
+    
+    
 class DreamRec(SequentialRecommender):
     """
     DreamRec: Guided Diffusion for Sequential Recommendation
     优化：区分训练/推理阶段，仅训练时启用随机mask
     """
-
     def __init__(self, config, dataset):
         super().__init__(config, dataset)
 
@@ -39,6 +96,9 @@ class DreamRec(SequentialRecommender):
         self.none_embedding = nn.Embedding(1, self.hidden_size)
         nn.init.normal_(self.none_embedding.weight, 0, self.initializer_range)
 
+        # ── 原版 LN/Dropout 组件（对齐顺序） ─────────────────────
+        self.emb_dropout = nn.Dropout(self.hidden_dropout_prob)  # 原版 emb_dropout
+        
         # ── Transformer 编码器（对齐原版 mh_attn + feed_forward + ln_1/2/3）
         self.trm_encoder = TransformerEncoder(
             n_layers=self.n_layers,
@@ -51,24 +111,20 @@ class DreamRec(SequentialRecommender):
             layer_norm_eps=self.layer_norm_eps,
             
         )
-        # ── 原版 LN/Dropout 组件（对齐顺序） ─────────────────────
-        self.emb_dropout = nn.Dropout(self.hidden_dropout_prob)  # 原版 emb_dropout
         #不需要self.ln_1 = nn.LayerNorm(self.hidden_size, eps=self.layer_norm_eps)  transfomer当中已经实现了
 
-        # ── 原有的占位（后面用） ─────────────────────────
-        self.proj = nn.Linear(self.hidden_size, self.n_items)
-        self.loss_fct = nn.CrossEntropyLoss()
-
-        # ── Diffusion 占位（第一步不改） ─────────────────
-        self.timesteps = config['timesteps']
-        self.beta_start = config['beta_start']
-        self.beta_end = config['beta_end']
-        self.beta_sche = config['beta_sche']
-        self.w = config['w']
-        self.diffuser_type = config['diffuser_type']
-
+        
+        #时间编码器
+        self.step_mlp = nn.Sequential(
+            SinusoidalPositionEmbeddings(self.hidden_size),
+            nn.Linear(self.hidden_size, self.hidden_size*2),
+            nn.GELU(),
+            nn.Linear(self.hidden_size*2, self.hidden_size),
+        )
+        # ── Diffusion─────────────────
+        self.diffusion = Diffusion(config, self.device)
         self.apply(self._init_weights)
-
+        
     def _init_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Embedding)):
             module.weight.data.normal_(mean=0.0, std=self.initializer_range)
@@ -77,9 +133,13 @@ class DreamRec(SequentialRecommender):
             module.weight.data.fill_(1.0)
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
-            
+    
+    #计算物品embedding
+    def cacu_x(self, x):
+        x = self.item_embedding(x)
+        return x        
 
-    def forward(self, item_seq, item_seq_len, enable_drop: bool = None):
+    def cacu_h(self, item_seq, item_seq_len, enable_drop: bool = None):
         """
         优化版 forward：精准区分训练/推理阶段的随机mask
         Args:
@@ -148,7 +208,27 @@ class DreamRec(SequentialRecommender):
             # 打印6：Dropout 信息
             print(f"[Forward] 训练阶段dropout: drop_mask有效占比={drop_mask.mean():.4f}")
         return h
-
+    
+    def forward(self, x,h,step):
+        t = self.step_mlp(step)  # 时间编码
+        if self.diffuser_type == 'mlp1':
+            res = self.diffuser(torch.cat((x, h, t), dim=1))
+        elif self.diffuser_type == 'mlp2':
+            res = self.diffuser(torch.cat((x, h, t), dim=1))
+        return res
+    
+    def forward_unconditional(self, x, step):
+        #不是很确定这里，到时候在看着改改
+        h = self.none_embedding(torch.tensor([0], device=x.device))  # 无条件向量
+        h = torch.cat([h] * x.size(0), dim=0)  # 扩展到批次大小
+        
+        t = self.step_mlp(step)  # 时间编码
+        if self.diffuser_type == 'mlp1':
+            res = self.diffuser(torch.cat((x, self.none_embedding.weight[0:1].expand(x.size(0), -1), t), dim=1))
+        elif self.diffuser_type == 'mlp2':
+            res = self.diffuser(torch.cat((x, self.none_embedding.weight[0:1].expand(x.size(0), -1), t), dim=1))
+        return res
+    
     def calculate_loss(self, interaction):
         """训练阶段：自动启用drop"""
         item_seq = interaction[self.ITEM_SEQ]
